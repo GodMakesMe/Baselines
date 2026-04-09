@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+	--surface: #f8fafc;
+	--text-main: #0f172a;
+	--text-muted: #475569;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	min-height: 100%;
+	background: var(--surface);
+	color: var(--text-main);
+	font-family: var(--font-heading), 'Segoe UI', sans-serif;
+}
+
+code,
+pre,
+kbd,
+samp {
+	font-family: var(--font-mono), 'Consolas', monospace;
+}

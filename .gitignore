@@ -1,0 +1,6 @@
+CV_Project
+.venv312/
+node_modules/
+dist/
+logs/
+*.log
