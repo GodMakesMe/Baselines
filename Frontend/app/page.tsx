@@ -37,6 +37,10 @@ type ProcessStatusResponse = {
   warnings?: string[];
 };
 
+const backendBaseUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:2632').replace(/\/$/, '');
+const maxUploadSizeMb = Number(process.env.NEXT_PUBLIC_MAX_UPLOAD_SIZE_MB || '95');
+const maxUploadSizeBytes = maxUploadSizeMb * 1024 * 1024;
+
 function groupOutputFiles(files: OutputFiles): GroupedOutputs {
   const grouped: GroupedOutputs = {
     vis: {},
@@ -280,6 +284,16 @@ export default function Home() {
       return;
     }
 
+    const totalSizeBytes = files.reduce((sum, file) => sum + file.size, 0);
+    if (totalSizeBytes > maxUploadSizeBytes) {
+      setError(
+        `Selected files are too large (${(totalSizeBytes / (1024 * 1024)).toFixed(1)} MB). ` +
+        `Current upload limit is ${maxUploadSizeMb} MB for this hosted endpoint. ` +
+        'Please upload a smaller ZIP/TIFF batch.',
+      );
+      return;
+    }
+
     setLoading(true);
     setError(null);
     setResponse(null);
@@ -293,7 +307,7 @@ export default function Home() {
         formData.append('files', file);
       });
 
-      const startRes = await axios.post<ProcessStartResponse>('http://localhost:2632/api/scripts/process', formData, {
+      const startRes = await axios.post<ProcessStartResponse>(`${backendBaseUrl}/api/scripts/process`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
@@ -308,7 +322,7 @@ export default function Home() {
       let finished = false;
       while (!finished) {
         await new Promise((resolve) => setTimeout(resolve, 2500));
-        const statusRes = await axios.get<ProcessStatusResponse>(`http://localhost:2632/api/scripts/process/${startedJobId}`, {
+        const statusRes = await axios.get<ProcessStatusResponse>(`${backendBaseUrl}/api/scripts/process/${startedJobId}`, {
           timeout: 0,
         });
 

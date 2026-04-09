@@ -527,7 +527,7 @@ def plot_orthogonal_slices(vol_result, output_dir):
     print(f"    ✅ Saved {out_path}")
 
 
-def generate_3d_volume_html(vol_result, output_dir, sub_size=80):
+def generate_3d_volume_html(vol_result, output_dir, sub_size=48):
     """Interactive Plotly 3D volume rendering saved as standalone HTML."""
     vol_id = vol_result["vol_id"]
     volume = vol_result["normalized"]
@@ -540,7 +540,14 @@ def generate_3d_volume_html(vol_result, output_dir, sub_size=80):
     x0 = max(0, w // 2 - sx // 2)
     sub = volume[z0 : z0 + sz, y0 : y0 + sy, x0 : x0 + sx]
 
-    vol = np.asarray(sub, dtype=float)
+    vol = np.asarray(sub, dtype=np.float32)
+
+    # If still too large, stride down further to keep browser memory stable.
+    max_voxels = 120_000
+    total_voxels = int(np.prod(vol.shape))
+    if total_voxels > max_voxels:
+        stride = int(np.ceil((total_voxels / max_voxels) ** (1 / 3)))
+        vol = vol[::stride, ::stride, ::stride]
     nx, ny, nz = vol.shape
     X, Y, Z = np.mgrid[0:nx, 0:ny, 0:nz]
 
@@ -551,8 +558,8 @@ def generate_3d_volume_html(vol_result, output_dir, sub_size=80):
             colorscale="Greys",
             cmin=float(vol.min()), cmax=float(vol.max()),
             isomin=float(vol.min()), isomax=float(vol.max()),
-            surface_count=20,
-            opacity=0.4,
+            surface_count=12,
+            opacity=0.25,
             opacityscale=[[0.0, 1.0], [0.3, 1.0], [1.0, 1.0]],
             caps=dict(x_show=False, y_show=False, z_show=False),
         )
@@ -741,8 +748,8 @@ def main():
                         help="(Optional) Directory containing matching label .tif files")
     parser.add_argument("--denoise", action="store_true",
                         help="Enable NL-means denoising (significantly slower)")
-    parser.add_argument("--sub_volume_size", type=int, default=80,
-                        help="Cube side length for 3D Plotly render (default: 80)")
+    parser.add_argument("--sub_volume_size", type=int, default=48,
+                        help="Cube side length for 3D Plotly render (default: 48)")
 
     args = parser.parse_args()
 

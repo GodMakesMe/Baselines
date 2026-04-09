@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import scriptRunRouter from './Routes/script-run';
@@ -5,8 +6,31 @@ import scriptRunRouter from './Routes/script-run';
 const app = express();
 const port = 2632;
 
+const defaultAllowedOrigins = [
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'https://godmakesme.com',
+  'https://www.godmakesme.com',
+  'https://cv.godmakesme.com',
+  'https://api.godmakesme.com',
+];
+
+const envAllowedOrigins = (process.env.CORS_ORIGINS ?? '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const allowedOrigins = new Set([...defaultAllowedOrigins, ...envAllowedOrigins]);
+
 app.use(cors({
-  origin: 'http://localhost:3000',
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.has(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error(`Origin not allowed by CORS: ${origin}`));
+  },
   credentials: true,
 }));
 app.use(express.json());
@@ -16,10 +40,17 @@ app.use('/api/scripts', scriptRunRouter);
 
 
 
-app.get('/', (req, res) => {
-  res.json({ message: 'Welcome to the TypeScript Backend' });
+app.get('/', (_req, res) => {
+  res.json({
+    message: 'Hello from backend',
+    service: 'api.godmakesme.com',
+  });
 });
 
-app.listen(port, () => {
-  console.log(`Server is running on http://localhost:${port}`);
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok' });
+});
+
+app.listen(port, '0.0.0.0', () => {
+  console.log(`Server is running on port ${port}`);
 });

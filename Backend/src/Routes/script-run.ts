@@ -21,6 +21,7 @@ const cvProjectDir = path.join(baseDir, '..', 'CV_project');
 const cvCheckpointsDir = path.join(cvProjectDir, 'checkpoints');
 const SCRIPT_TIMEOUT_MS = 45 * 60 * 1000;
 const JOB_RETENTION_MS = 30 * 60 * 1000;
+const MAX_INLINE_HTML_BYTES = Number(process.env.max_inline_html_bytes ?? 4 * 1024 * 1024);
 
 type JobState = 'queued' | 'running' | 'completed' | 'failed';
 
@@ -248,10 +249,10 @@ function inferMimeType(extension: string): string {
   return 'application/octet-stream';
 }
 
-function collectOutputArtifacts(directoryPath: string): Record<string, OutputArtifact> {
+function collectOutputArtifacts(directoryPath: string, warnings: string[]): Record<string, OutputArtifact> {
   const outputFiles = collectFilesRecursively(
     directoryPath,
-    new Set(['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.html', '.csv', '.json']),
+    new Set(['.png', '.jpg', '.jpeg', '.html', '.csv', '.json']),
   );
   const fileContents: Record<string, OutputArtifact> = {};
 
@@ -260,7 +261,25 @@ function collectOutputArtifacts(directoryPath: string): Record<string, OutputArt
     const extension = path.extname(filePath).toLowerCase();
     const mimeType = inferMimeType(extension);
 
-    if (extension === '.html' || extension === '.csv' || extension === '.json') {
+    if (extension === '.html') {
+      const fileSize = fs.statSync(filePath).size;
+      if (fileSize > MAX_INLINE_HTML_BYTES) {
+        warnings.push(
+          `Skipped large 3D HTML (${relativePath}, ${(fileSize / (1024 * 1024)).toFixed(1)} MB) ` +
+          `to prevent memory crashes. Generate with smaller sub-volume size to view in app.`,
+        );
+        continue;
+      }
+
+      fileContents[relativePath] = {
+        mimeType,
+        encoding: 'utf8',
+        data: fs.readFileSync(filePath, 'utf8'),
+      };
+      continue;
+    }
+
+    if (extension === '.csv' || extension === '.json') {
       fileContents[relativePath] = {
         mimeType,
         encoding: 'utf8',
@@ -384,7 +403,7 @@ async function processJob(jobId: string, uploadedFiles: Express.Multer.File[]): 
     ]);
 
     updateJob(jobId, { stage: 'collecting', message: 'Collecting output files...' });
-    const fileContents = collectOutputArtifacts(jobOutputsDir);
+    const fileContents = collectOutputArtifacts(jobOutputsDir, warnings);
 
     await cleanupDirs([jobBaseDir]);
 
