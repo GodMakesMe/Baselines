@@ -41,6 +41,7 @@ type ProcessingJob = {
   files?: Record<string, OutputArtifact>;
   error?: string;
   warnings?: string[];
+  timings?: Record<string, number>;
 };
 
 const jobs = new Map<string, ProcessingJob>();
@@ -377,6 +378,7 @@ async function processJob(jobId: string, uploadedFiles: Express.Multer.File[]): 
     }
 
     updateJob(jobId, { stage: 'visualization', message: 'Running vesuvius visualization...' });
+    const visStart = Date.now();
     try {
       const visualizationArgs = ['--input_dir', jobUploadsDir, '--output_dir', visOutputsDir];
 
@@ -393,16 +395,31 @@ async function processJob(jobId: string, uploadedFiles: Express.Multer.File[]): 
       warnings.push(`Visualization step failed: ${error?.message || 'Unknown visualization error'}`);
       updateJob(jobId, { stage: 'visualization_warning', message: 'Visualization failed, continuing with model inference...' });
     }
+    const visEnd = Date.now();
 
-    updateJob(jobId, { stage: 'model_inference', message: 'Running model inference...' });
+    // Collect early visualization results and push them to the job
+    const earlyVisFiles = collectOutputArtifacts(jobOutputsDir, warnings);
+    updateJob(jobId, { 
+      stage: 'model_inference', 
+      message: 'Running model inference...',
+      files: earlyVisFiles, // Publish partial files early to frontend
+      timings: { ...(jobs.get(jobId)?.timings || {}), visualization: visEnd - visStart }
+    });
+    
+    const modelStart = Date.now();
     await runPythonScript(modelInferenceScript, [
       '--input-dir', jobUploadsDir,
       '--output-dir', jobOutputsDir,
       '--project-dir', cvProjectDir,
       '--checkpoints-dir', cvCheckpointsDir,
     ]);
+    const modelEnd = Date.now();
 
-    updateJob(jobId, { stage: 'collecting', message: 'Collecting output files...' });
+    updateJob(jobId, { 
+      stage: 'collecting', 
+      message: 'Collecting output files...',
+      timings: { ...(jobs.get(jobId)?.timings || {}), modelInference: modelEnd - modelStart }
+    });
     const fileContents = collectOutputArtifacts(jobOutputsDir, warnings);
 
     await cleanupDirs([jobBaseDir]);
@@ -496,6 +513,7 @@ router.get('/process/:jobId', (req: Request, res: Response) => {
     warnings: job.warnings,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
+    timings: job.timings,
   });
 });
 
