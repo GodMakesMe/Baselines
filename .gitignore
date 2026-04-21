@@ -4,3 +4,7 @@ node_modules/
 dist/
 logs/
 *.log
+Winner/
+output/
+outputs/
+temp/

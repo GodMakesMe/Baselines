@@ -188,6 +188,16 @@ def to_3class(surface_mask, air_prob, papyrus_prob):
 SEG_CMAP = ListedColormap(["black", "red", "dodgerblue"])
 
 
+def model_output_subdir(model_name):
+    if model_name == "3D U-Net":
+        return "unet"
+    if model_name == "nnU-Net Ensemble":
+        return "nnunet"
+    if model_name == "Final Model":
+        return "final"
+    return "model"
+
+
 def visualize_volume(image, predictions, sample_id, output_dir, gt=None):
     """Save axial slice comparison at 25%, 50%, 75% depth."""
     slices = [0.25, 0.5, 0.75]
@@ -271,6 +281,39 @@ def visualize_surface_prob(image, prob_maps, sample_id, output_dir, gt=None):
     print(f"    Saved {out_path}")
 
 
+def save_model_previews(image, predictions, prob_maps, sample_id, output_dir):
+    """Save per-model overlay and probability previews into grouped folders."""
+    idx = image.shape[0] // 2
+    for model_name, pred in predictions.items():
+        subdir = os.path.join(output_dir, model_output_subdir(model_name))
+        os.makedirs(subdir, exist_ok=True)
+
+        overlay_path = os.path.join(subdir, f"{sample_id}_{model_output_subdir(model_name)}_overlay.png")
+        fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+        ax.imshow(image[idx], cmap="gray", alpha=0.5)
+        ax.imshow(pred[idx], cmap=SEG_CMAP, alpha=0.5, vmin=0, vmax=2)
+        ax.set_title(f"{model_name} ({sample_id})", fontweight="bold")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.tight_layout()
+        fig.savefig(overlay_path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+
+        if model_name in prob_maps:
+            prob_path = os.path.join(subdir, f"{sample_id}_{model_output_subdir(model_name)}_surface_prob.png")
+            fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+            im = ax.imshow(prob_maps[model_name][idx], cmap="hot", vmin=0, vmax=1)
+            ax.set_title(f"{model_name} Surface Prob", fontweight="bold")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            plt.colorbar(im, ax=ax, fraction=0.046)
+            fig.tight_layout()
+            fig.savefig(prob_path, dpi=140, bbox_inches="tight")
+            plt.close(fig)
+
+        print(f"    Saved previews for {model_name} in {subdir}")
+
+
 # =============================================================================
 #  MODEL LOADING
 # =============================================================================
@@ -305,7 +348,7 @@ def load_custom_unet(project_dir, checkpoints_dir, device):
     return model, get_gaussian_3d
 
 
-def load_nnunet_ensemble(project_dir, device):
+def load_nnunet_ensemble(project_dir, device, tile_step_size=0.5, use_mirroring=True):
     """Load nnU-Net ensemble predictors."""
     os.environ["nnUNet_raw"] = os.path.join(project_dir, "nnUNet_data", "nnUNet_raw")
     os.environ["nnUNet_preprocessed"] = os.path.join(project_dir, "nnUNet_data", "nnUNet_preprocessed")
@@ -332,13 +375,13 @@ def load_nnunet_ensemble(project_dir, device):
         model_dir = os.path.join(results_base, subdir)
         ckpt_file = os.path.join(model_dir, "fold_all", "checkpoint_best.pth")
         if not os.path.exists(ckpt_file):
-            print(f"  nnU-Net [{name}] checkpoint not found, skipping")
+            print(f"  nnU-Net [{name}] checkpoint not found, skipping: {ckpt_file}")
             continue
 
         pred = nnUNetPredictor(
-            tile_step_size=0.5,
+            tile_step_size=tile_step_size,
             use_gaussian=True,
-            use_mirroring=True,
+            use_mirroring=use_mirroring,
             device=device,
             verbose=False,
         )
@@ -347,6 +390,65 @@ def load_nnunet_ensemble(project_dir, device):
         )
         predictors[name] = (pred, weight)
         print(f"  nnU-Net [{name}] loaded (weight={weight})")
+
+    return predictors
+
+
+def load_final_nnunet_models(
+    final_models_dir,
+    device,
+    tile_step_size=0.5,
+    use_mirroring=True,
+    max_models=0,
+):
+    """Load additional final nnU-Net checkpoints from checkpoints/final_models."""
+    try:
+        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+    except ImportError as e:
+        print(f"  Cannot import nnUNetPredictor for final models: {e}")
+        return {}
+
+    if not os.path.isdir(final_models_dir):
+        print(f"  Final models directory not found: {final_models_dir}")
+        return {}
+
+    model_dirs = sorted(
+        p for p in glob(os.path.join(final_models_dir, "*")) if os.path.isdir(p)
+    )
+    if not model_dirs:
+        print("  No final model directories found")
+        return {}
+
+    predictors = {}
+    valid_model_dirs = []
+    for model_dir in model_dirs:
+        ckpt_file = os.path.join(model_dir, "fold_all", "checkpoint_best.pth")
+        if os.path.exists(ckpt_file):
+            valid_model_dirs.append(model_dir)
+
+    if not valid_model_dirs:
+        print("  No checkpoint_best.pth files found in final models")
+        return {}
+
+    if max_models > 0:
+        valid_model_dirs = valid_model_dirs[:max_models]
+        print(f"  Limiting final models to first {len(valid_model_dirs)} for speed")
+
+    weight = 1.0 / len(valid_model_dirs)
+    for model_dir in valid_model_dirs:
+        name = os.path.basename(model_dir)
+        pred = nnUNetPredictor(
+            tile_step_size=tile_step_size,
+            use_gaussian=True,
+            use_mirroring=use_mirroring,
+            device=device,
+            verbose=False,
+        )
+        pred.initialize_from_trained_model_folder(
+            model_dir, use_folds=("all",), checkpoint_name="checkpoint_best.pth"
+        )
+        predictors[name] = (pred, weight)
+        print(f"  Final nnU-Net [{name}] loaded (weight={weight:.3f})")
 
     return predictors
 
@@ -414,6 +516,26 @@ def main():
     )
     parser.add_argument("--skip-unet", action="store_true", help="Skip custom 3D U-Net")
     parser.add_argument("--skip-nnunet", action="store_true", help="Skip nnU-Net ensemble")
+    parser.add_argument(
+        "--skip-final-model", action="store_true",
+        help="Skip additional final nnU-Net model(s) from checkpoints/final_models",
+    )
+    parser.add_argument(
+        "--final-models-dir", default=None,
+        help="Directory containing final nnU-Net model folders (default: <checkpoints-dir>/final_models)",
+    )
+    parser.add_argument(
+        "--nnunet-tile-step-size", type=float, default=0.5,
+        help="nnU-Net tile step size (higher is faster, lower may be more accurate). Default: 0.5",
+    )
+    parser.add_argument(
+        "--nnunet-no-mirroring", action="store_true",
+        help="Disable nnU-Net mirroring/TTA for faster inference",
+    )
+    parser.add_argument(
+        "--final-max-models", type=int, default=0,
+        help="Maximum number of final nnU-Net models to run (0 = all)",
+    )
     parser.add_argument("--t-low", type=float, default=0.2, help="Hysteresis low threshold (default: 0.2)")
     parser.add_argument("--t-high", type=float, default=0.83, help="Hysteresis high threshold (default: 0.83)")
     parser.add_argument("--min-size", type=int, default=2000, help="Min component size for dust removal (default: 2000)")
@@ -434,6 +556,9 @@ def main():
 
     if args.checkpoints_dir is None:
         args.checkpoints_dir = os.path.join(args.project_dir, "checkpoints")
+
+    if args.final_models_dir is None:
+        args.final_models_dir = os.path.join(args.checkpoints_dir, "final_models")
 
     if not os.path.isdir(args.input_dir):
         print(f"Input directory not found: {args.input_dir}")
@@ -464,6 +589,11 @@ def main():
     print(f"  Device         : {device}")
     print(f"  Custom U-Net   : {'skip' if args.skip_unet else 'enabled'}")
     print(f"  nnU-Net        : {'skip' if args.skip_nnunet else 'enabled'}")
+    print(f"  Final model    : {'skip' if args.skip_final_model else 'enabled'}")
+    print(f"  Final dir      : {args.final_models_dir}")
+    print(f"  nnU-Net step   : {args.nnunet_tile_step_size}")
+    print(f"  nnU mirror TTA : {'off' if args.nnunet_no_mirroring else 'on'}")
+    print(f"  Final max mdl  : {args.final_max_models if args.final_max_models > 0 else 'all'}")
     print(f"  Post-proc      : t_low={args.t_low}, t_high={args.t_high}, min_size={args.min_size}")
     print(f"  Patch/overlap  : {args.patch_size} / {args.overlap}")
     print(f"  Volumes found  : {len(tif_files)}")
@@ -473,6 +603,7 @@ def main():
     model_unet = None
     gaussian_fn = None
     nnunet_predictors = {}
+    final_nnunet_predictors = {}
 
     if not args.skip_unet:
         print("\nLoading custom 3D U-Net ...")
@@ -480,15 +611,31 @@ def main():
 
     if not args.skip_nnunet:
         print("\nLoading nnU-Net ensemble ...")
-        nnunet_predictors = load_nnunet_ensemble(args.project_dir, device)
+        nnunet_predictors = load_nnunet_ensemble(
+            args.project_dir,
+            device,
+            tile_step_size=args.nnunet_tile_step_size,
+            use_mirroring=not args.nnunet_no_mirroring,
+        )
 
-    if model_unet is None and not nnunet_predictors:
+    if not args.skip_final_model:
+        print("\nLoading final nnU-Net model(s) ...")
+        final_nnunet_predictors = load_final_nnunet_models(
+            args.final_models_dir,
+            device,
+            tile_step_size=args.nnunet_tile_step_size,
+            use_mirroring=not args.nnunet_no_mirroring,
+            max_models=args.final_max_models,
+        )
+
+    if model_unet is None and not nnunet_predictors and not final_nnunet_predictors:
         print("No models could be loaded. Exiting.")
         sys.exit(1)
 
     print(
         f"\nModels ready: custom_unet={model_unet is not None}, "
-        f"nnunet_models={list(nnunet_predictors.keys())}"
+        f"nnunet_models={list(nnunet_predictors.keys())}, "
+        f"final_models={list(final_nnunet_predictors.keys())}"
     )
 
     # ── Inference loop ────────────────────────────────────────────────────
@@ -538,6 +685,16 @@ def main():
             prob_maps["nnU-Net Ensemble"] = probs_ens[1]
             print(f"    Surface voxels: {(pred_3c == 1).sum():,}")
 
+        # ── Final nnU-Net model(s) ──
+        if final_nnunet_predictors:
+            print("  Running final nnU-Net model(s) ...")
+            probs_final = ensemble_nnunet(final_nnunet_predictors, image)
+            surface_pp = postprocess(probs_final[1], args.t_low, args.t_high, args.min_size)
+            pred_3c = to_3class(surface_pp, probs_final[0], probs_final[2])
+            predictions["Final Model"] = pred_3c
+            prob_maps["Final Model"] = probs_final[1]
+            print(f"    Surface voxels: {(pred_3c == 1).sum():,}")
+
         if not predictions:
             print(f"  No predictions for {sample_id}, skipping.")
             continue
@@ -552,10 +709,12 @@ def main():
                     print(f"  {name:<25} {m['surface_dice']:>13.4f} {m['mean_dice']:>10.4f}")
 
         # ── Save best mask ──
-        best_name = (
-            "nnU-Net Ensemble" if "nnU-Net Ensemble" in predictions
-            else list(predictions.keys())[0]
-        )
+        if "Final Model" in predictions:
+            best_name = "Final Model"
+        elif "nnU-Net Ensemble" in predictions:
+            best_name = "nnU-Net Ensemble"
+        else:
+            best_name = list(predictions.keys())[0]
         best_pred = predictions[best_name]
         mask_path = os.path.join(args.output_dir, f"{sample_id}.tif")
         tifffile.imwrite(mask_path, best_pred)
@@ -564,6 +723,7 @@ def main():
         # ── Visualize ──
         visualize_volume(image, predictions, sample_id, args.output_dir, gt=gt)
         visualize_surface_prob(image, prob_maps, sample_id, args.output_dir, gt=gt)
+        save_model_previews(image, predictions, prob_maps, sample_id, args.output_dir)
 
         torch.cuda.empty_cache()
 
@@ -595,6 +755,7 @@ def main():
             "models": {
                 "custom_unet": model_unet is not None,
                 "nnunet_models": list(nnunet_predictors.keys()),
+                "final_models": list(final_nnunet_predictors.keys()),
             },
         },
     }

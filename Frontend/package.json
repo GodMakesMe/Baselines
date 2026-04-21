@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "pm2:start": "pm2 start 'npm start' --name 'frontend' --cwd .\" && pm2 save",
+    "pm2:start": "pm2 start start-frontend.js --name frontend && pm2 save",
     "pm2:stop": "pm2 stop frontend",
     "pm2:restart": "pm2 restart frontend",
     "pm2:logs": "pm2 logs frontend"

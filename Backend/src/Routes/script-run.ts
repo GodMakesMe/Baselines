@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { execFile } from 'child_process';
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import unzipper from 'unzipper';
@@ -17,6 +17,8 @@ const envFilePath = path.join(baseDir, '.env');
 const fallbackPythonExecutable = path.join(baseDir, '..', '..', '.venv', 'Scripts', 'python.exe');
 const visualizationScript = path.join(baseDir, 'src', 'Scripts', 'vesuvius_visualize.py');
 const modelInferenceScript = path.join(baseDir, 'src', 'Scripts', 'model_inference.py');
+const kaggleSegmentationScript = path.join(baseDir, 'src', 'Scripts', 'kaggle_segmentation_inference.py');
+const inkDetectionScript = path.join(baseDir, 'src', 'Scripts', 'ink_detection_inference.py');
 const cvProjectDir = path.join(baseDir, '..', 'CV_project');
 const cvCheckpointsDir = path.join(cvProjectDir, 'checkpoints');
 const SCRIPT_TIMEOUT_MS = 45 * 60 * 1000;
@@ -38,6 +40,7 @@ type ProcessingJob = {
   message: string;
   createdAt: number;
   updatedAt: number;
+  logLines?: string[];
   files?: Record<string, OutputArtifact>;
   error?: string;
   warnings?: string[];
@@ -150,15 +153,40 @@ function resolveLabelsDir(): string | null {
   return null;
 }
 
-function resolveBooleanEnv(key: string): boolean {
+function resolveBooleanEnv(...keys: string[]): boolean {
   const envFile = parseEnvFile(envFilePath);
-  const rawValue = process.env[key] ?? envFile[key];
+
+  let rawValue: string | undefined;
+  for (const key of keys) {
+    rawValue = process.env[key] ?? envFile[key];
+    if (rawValue !== undefined) {
+      break;
+    }
+  }
 
   if (!rawValue) {
     return false;
   }
 
   return ['1', 'true', 'yes', 'on'].includes(rawValue.trim().toLowerCase());
+}
+
+function resolveNumberEnv(defaultValue: number, ...keys: string[]): number {
+  const envFile = parseEnvFile(envFilePath);
+
+  for (const key of keys) {
+    const rawValue = process.env[key] ?? envFile[key];
+    if (rawValue === undefined) {
+      continue;
+    }
+
+    const parsed = Number(rawValue);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return defaultValue;
 }
 
 function createJob(): ProcessingJob {
@@ -183,6 +211,29 @@ function updateJob(jobId: string, updates: Partial<ProcessingJob>): void {
   jobs.set(jobId, {
     ...existing,
     ...updates,
+    updatedAt: Date.now(),
+  });
+}
+
+function appendJobLog(jobId: string, line: string): void {
+  const existing = jobs.get(jobId);
+  if (!existing) {
+    return;
+  }
+
+  const normalized = line.trim();
+  if (!normalized) {
+    return;
+  }
+
+  const nextLines = [...(existing.logLines ?? []), normalized];
+  const maxLines = 200;
+  const logLines = nextLines.length > maxLines ? nextLines.slice(nextLines.length - maxLines) : nextLines;
+
+  jobs.set(jobId, {
+    ...existing,
+    logLines,
+    message: normalized,
     updatedAt: Date.now(),
   });
 }
@@ -247,13 +298,14 @@ function inferMimeType(extension: string): string {
   if (ext === '.html') return 'text/html';
   if (ext === '.csv') return 'text/csv';
   if (ext === '.json') return 'application/json';
+  if (ext === '.txt') return 'text/plain';
   return 'application/octet-stream';
 }
 
 function collectOutputArtifacts(directoryPath: string, warnings: string[]): Record<string, OutputArtifact> {
   const outputFiles = collectFilesRecursively(
     directoryPath,
-    new Set(['.png', '.jpg', '.jpeg', '.html', '.csv', '.json']),
+    new Set(['.png', '.jpg', '.jpeg', '.html', '.csv', '.json', '.txt']),
   );
   const fileContents: Record<string, OutputArtifact> = {};
 
@@ -280,7 +332,7 @@ function collectOutputArtifacts(directoryPath: string, warnings: string[]): Reco
       continue;
     }
 
-    if (extension === '.csv' || extension === '.json') {
+    if (extension === '.csv' || extension === '.json' || extension === '.txt') {
       fileContents[relativePath] = {
         mimeType,
         encoding: 'utf8',
@@ -300,31 +352,105 @@ function collectOutputArtifacts(directoryPath: string, warnings: string[]): Reco
   return fileContents;
 }
 
-function runPythonScript(scriptPath: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+function runPythonScript(
+  scriptPath: string,
+  args: string[],
+  logPrefix: string,
+  onLogLine?: (line: string) => void,
+): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = spawn(
       pythonExecutable,
       [scriptPath, ...args],
       {
         cwd: baseDir,
-        maxBuffer: 50 * 1024 * 1024,
-        timeout: SCRIPT_TIMEOUT_MS,
         env: {
           ...process.env,
           PYTHONIOENCODING: 'utf-8',
           PYTHONUTF8: '1',
+          PYTHONUNBUFFERED: '1',
         },
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          const details = [error.message, stderr].filter(Boolean).join('\n');
-          reject(new Error(details || 'Python script execution failed'));
-          return;
-        }
-
-        resolve({ stdout, stderr });
+        windowsHide: true,
       },
     );
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, SCRIPT_TIMEOUT_MS);
+
+    console.log(`[${logPrefix}] START ${pythonExecutable} ${scriptPath} ${args.join(' ')}`);
+    if (onLogLine) {
+      onLogLine(`[${logPrefix}] START ${pythonExecutable} ${scriptPath} ${args.join(' ')}`);
+    }
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8');
+      stdout += text;
+      process.stdout.write(`[${logPrefix}] ${text}`);
+      if (onLogLine) {
+        text.split(/\r?\n/).forEach((line) => {
+          if (line.trim()) {
+            onLogLine(`[${logPrefix}] ${line}`);
+          }
+        });
+      }
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8');
+      stderr += text;
+      process.stderr.write(`[${logPrefix}] ${text}`);
+      if (onLogLine) {
+        text.split(/\r?\n/).forEach((line) => {
+          if (line.trim()) {
+            onLogLine(`[${logPrefix}] ${line}`);
+          }
+        });
+      }
+    });
+
+    child.on('error', (error) => {
+      clearTimeout(timeoutHandle);
+      if (onLogLine) {
+        onLogLine(`[${logPrefix}] ERROR ${error.message}`);
+      }
+      reject(new Error(`${logPrefix} launch error: ${error.message}`));
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timeoutHandle);
+
+      if (timedOut) {
+        if (onLogLine) {
+          onLogLine(`[${logPrefix}] TIMEOUT after ${SCRIPT_TIMEOUT_MS} ms`);
+        }
+        reject(new Error(`${logPrefix} timed out after ${SCRIPT_TIMEOUT_MS} ms`));
+        return;
+      }
+
+      if (code !== 0) {
+        if (onLogLine) {
+          onLogLine(`[${logPrefix}] FAILED exit=${code}`);
+        }
+        const details = [
+          `${logPrefix} failed with exit code ${code}`,
+          stderr.trim(),
+        ].filter(Boolean).join('\n');
+        reject(new Error(details || 'Python script execution failed'));
+        return;
+      }
+
+      console.log(`[${logPrefix}] DONE`);
+      if (onLogLine) {
+        onLogLine(`[${logPrefix}] DONE`);
+      }
+      resolve({ stdout, stderr });
+    });
   });
 }
 
@@ -350,15 +476,28 @@ async function processJob(jobId: string, uploadedFiles: Express.Multer.File[]): 
   const jobUploadsDir = path.join(jobBaseDir, 'uploads');
   const jobOutputsDir = path.join(jobBaseDir, 'outputs');
   const visOutputsDir = path.join(jobOutputsDir, 'vis');
+  const kaggleSegOutputsDir = path.join(jobOutputsDir, 'kaggle_seg');
+  const textRecoveryOutputsDir = path.join(jobOutputsDir, 'text_recovery');
+  const segOutputInputDir = path.join(jobOutputsDir, 'segmentation_input');
   const warnings: string[] = [];
   const labelsDir = resolveLabelsDir();
-  const useDenoise = resolveBooleanEnv('vis_denoise');
+  const useDenoise = resolveBooleanEnv('vis_denoise', 'VIS_DENOISE');
+  const enableKaggleSeg = resolveBooleanEnv('enable_kaggle_seg', 'ENABLE_KAGGLE_SEG');
+  const enableInkDetection = resolveBooleanEnv('enable_ink_detection', 'ENABLE_INK_DETECTION');
+  const inferenceFastMode = resolveBooleanEnv('inference_fast_mode', 'INFERENCE_FAST_MODE');
+  const finalMaxModels = resolveNumberEnv(0, 'inference_final_max_models', 'INFERENCE_FINAL_MAX_MODELS');
+  const nnunetTileStep = resolveNumberEnv(0.5, 'inference_nnunet_tile_step', 'INFERENCE_NNUNET_TILE_STEP');
+  const nnunetNoMirroring = resolveBooleanEnv('inference_nnunet_no_mirroring', 'INFERENCE_NNUNET_NO_MIRRORING');
+  const skipLegacyNnUnetByEnv = resolveBooleanEnv('inference_skip_legacy_nnunet', 'INFERENCE_SKIP_LEGACY_NNUNET');
 
   try {
     updateJob(jobId, { status: 'running', stage: 'preparing', message: 'Preparing files...' });
     ensureDirectory(jobUploadsDir);
     ensureDirectory(jobOutputsDir);
     ensureDirectory(visOutputsDir);
+    ensureDirectory(kaggleSegOutputsDir);
+    ensureDirectory(textRecoveryOutputsDir);
+    ensureDirectory(segOutputInputDir);
     copyUploadedFiles(uploadedFiles, jobUploadsDir);
 
     updateJob(jobId, { stage: 'extracting', message: 'Extracting uploads...' });
@@ -390,7 +529,12 @@ async function processJob(jobId: string, uploadedFiles: Express.Multer.File[]): 
         visualizationArgs.push('--denoise');
       }
 
-      await runPythonScript(visualizationScript, visualizationArgs);
+      await runPythonScript(
+        visualizationScript,
+        visualizationArgs,
+        `job:${jobId}:visualization`,
+        (line) => appendJobLog(jobId, line),
+      );
     } catch (error: any) {
       warnings.push(`Visualization step failed: ${error?.message || 'Unknown visualization error'}`);
       updateJob(jobId, { stage: 'visualization_warning', message: 'Visualization failed, continuing with model inference...' });
@@ -407,13 +551,101 @@ async function processJob(jobId: string, uploadedFiles: Express.Multer.File[]): 
     });
     
     const modelStart = Date.now();
-    await runPythonScript(modelInferenceScript, [
+    const modelInferenceArgs = [
       '--input-dir', jobUploadsDir,
       '--output-dir', jobOutputsDir,
       '--project-dir', cvProjectDir,
       '--checkpoints-dir', cvCheckpointsDir,
-    ]);
+    ];
+
+    const legacyNnUnetCkptPaths = [
+      path.join(cvProjectDir, 'nnUNet_data', 'nnUNet_results', 'Dataset200_VesuviusSurface', 'nnUNetTrainer__nnUNetPlans__3d_fullres', 'fold_all', 'checkpoint_best.pth'),
+      path.join(cvProjectDir, 'nnUNet_data', 'nnUNet_results', 'Dataset200_VesuviusSurface', 'nnUNetTrainer_4000epochs__nnUNetResEncUNetMPlans__3d_fullres', 'fold_all', 'checkpoint_best.pth'),
+      path.join(cvProjectDir, 'nnUNet_data', 'nnUNet_results', 'Dataset200_VesuviusSurface', 'nnUNetTrainer_4000epochs__nnUNetResEncUNetLPlans__3d_fullres', 'fold_all', 'checkpoint_best.pth'),
+    ];
+    const hasLegacyNnUnetCkpt = legacyNnUnetCkptPaths.some((p) => fs.existsSync(p));
+    if (skipLegacyNnUnetByEnv || !hasLegacyNnUnetCkpt) {
+      modelInferenceArgs.push('--skip-nnunet');
+      appendJobLog(
+        jobId,
+        `[job:${jobId}:model_inference] Legacy nnU-Net skipped (${skipLegacyNnUnetByEnv ? 'env flag' : 'checkpoints not found in nnUNet_data'}).`,
+      );
+    }
+
+    if (inferenceFastMode) {
+      const fastFinalModels = finalMaxModels > 0 ? finalMaxModels : 2;
+      modelInferenceArgs.push('--final-max-models', String(fastFinalModels));
+      modelInferenceArgs.push('--nnunet-tile-step-size', String(nnunetTileStep > 0 ? nnunetTileStep : 0.7));
+      modelInferenceArgs.push('--nnunet-no-mirroring');
+    } else {
+      if (finalMaxModels > 0) {
+        modelInferenceArgs.push('--final-max-models', String(finalMaxModels));
+      }
+      if (nnunetTileStep > 0) {
+        modelInferenceArgs.push('--nnunet-tile-step-size', String(nnunetTileStep));
+      }
+      if (nnunetNoMirroring) {
+        modelInferenceArgs.push('--nnunet-no-mirroring');
+      }
+    }
+
+    await runPythonScript(modelInferenceScript, modelInferenceArgs, `job:${jobId}:model_inference`, (line) => appendJobLog(jobId, line));
     const modelEnd = Date.now();
+
+    const segmentationMasks = collectFilesRecursively(jobOutputsDir, new Set(['.tif', '.tiff']));
+    for (const segmentationMask of segmentationMasks) {
+      const outputName = path.basename(segmentationMask);
+      const targetPath = path.join(segOutputInputDir, outputName);
+
+      if (!fs.existsSync(targetPath)) {
+        fs.copyFileSync(segmentationMask, targetPath);
+      }
+    }
+
+    if (enableKaggleSeg) {
+      updateJob(jobId, {
+        stage: 'kaggle_segmentation',
+        message: 'Running Kaggle 1st-place segmentation baseline...',
+      });
+
+      const kaggleStart = Date.now();
+      try {
+        await runPythonScript(kaggleSegmentationScript, [
+          '--input-dir', jobUploadsDir,
+          '--output-dir', kaggleSegOutputsDir,
+        ], `job:${jobId}:kaggle_segmentation`, (line) => appendJobLog(jobId, line));
+      } catch (error: any) {
+        warnings.push(`Kaggle segmentation baseline failed: ${error?.message || 'Unknown error'}`);
+      }
+      const kaggleEnd = Date.now();
+
+      updateJob(jobId, {
+        timings: { ...(jobs.get(jobId)?.timings || {}), kaggleSegmentation: kaggleEnd - kaggleStart },
+      });
+    }
+
+    if (enableInkDetection) {
+      updateJob(jobId, {
+        stage: 'ink_detection',
+        message: 'Running TimeSformer ink detection...',
+      });
+
+      const inkStart = Date.now();
+      try {
+        await runPythonScript(inkDetectionScript, [
+          '--input-dir', jobUploadsDir,
+          '--segmentation-dir', segOutputInputDir,
+          '--output-dir', textRecoveryOutputsDir,
+        ], `job:${jobId}:ink_detection`, (line) => appendJobLog(jobId, line));
+      } catch (error: any) {
+        warnings.push(`TimeSformer ink detection failed: ${error?.message || 'Unknown error'}`);
+      }
+      const inkEnd = Date.now();
+
+      updateJob(jobId, {
+        timings: { ...(jobs.get(jobId)?.timings || {}), inkDetection: inkEnd - inkStart },
+      });
+    }
 
     updateJob(jobId, { 
       stage: 'collecting', 
@@ -508,7 +740,8 @@ router.get('/process/:jobId', (req: Request, res: Response) => {
     status: job.status,
     stage: job.stage,
     message: job.message,
-    files: job.files,
+    logLines: job.logLines,
+    files: job.status === 'completed' ? job.files : undefined,
     error: job.error,
     warnings: job.warnings,
     createdAt: job.createdAt,
@@ -526,7 +759,7 @@ router.post('/run', async (req: Request, res: Response) => {
   }
 
   try {
-    const { stdout, stderr } = await runPythonScript(script, []);
+    const { stdout, stderr } = await runPythonScript(script, [], 'manual:run');
     res.json({
       success: true,
       stdout,
@@ -547,6 +780,8 @@ router.get('/list', (req: Request, res: Response) => {
     scripts: [
       { name: 'vesuvius_visualize.py', description: 'Generate visualization outputs' },
       { name: 'model_inference.py', description: 'Generate UNet and nnUNet outputs' },
+      { name: 'kaggle_segmentation_inference.py', description: 'Run Kaggle 1st-place segmentation baseline' },
+      { name: 'ink_detection_inference.py', description: 'Run TimeSformer ink detection + text enhancement' },
     ],
   });
 });

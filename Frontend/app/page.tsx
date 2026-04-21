@@ -16,6 +16,9 @@ type GroupedOutputs = {
   vis: OutputFiles;
   unet: OutputFiles;
   nnunet: OutputFiles;
+  finalModel: OutputFiles;
+  kaggleSeg: OutputFiles;
+  textRecovery: OutputFiles;
   other: OutputFiles;
 };
 
@@ -23,7 +26,7 @@ type ProcessStartResponse = {
   success: boolean;
   jobId: string;
   status: 'queued' | 'running' | 'completed' | 'failed';
-  stage: string;
+  stage: string;cd 
   message: string;
 };
 
@@ -33,6 +36,7 @@ type ProcessStatusResponse = {
   status: 'queued' | 'running' | 'completed' | 'failed';
   stage: string;
   message: string;
+  logLines?: string[];
   files?: OutputFiles;
   error?: string;
   warnings?: string[];
@@ -48,6 +52,9 @@ function groupOutputFiles(files: OutputFiles): GroupedOutputs {
     vis: {},
     unet: {},
     nnunet: {},
+    finalModel: {},
+    kaggleSeg: {},
+    textRecovery: {},
     other: {},
   };
 
@@ -64,6 +71,21 @@ function groupOutputFiles(files: OutputFiles): GroupedOutputs {
 
     if (filename.startsWith('nnunet/')) {
       grouped.nnunet[filename] = artifact;
+      return;
+    }
+
+    if (filename.startsWith('final/')) {
+      grouped.finalModel[filename] = artifact;
+      return;
+    }
+
+    if (filename.startsWith('kaggle_seg/')) {
+      grouped.kaggleSeg[filename] = artifact;
+      return;
+    }
+
+    if (filename.startsWith('text_recovery/')) {
+      grouped.textRecovery[filename] = artifact;
       return;
     }
 
@@ -272,6 +294,7 @@ export default function Home() {
   const [jobMessage, setJobMessage] = useState<string | null>(null);
   const [selectedImage, setSelectedImage] = useState<{ src: string; name: string } | null>(null);
   const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
+  const [activeResultTab, setActiveResultTab] = useState<'visualization' | 'segmentation' | 'text-recovery' | 'other'>('visualization');
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -348,13 +371,26 @@ export default function Home() {
         message: startRes.data.message,
         timings: { uploadAndContact: uploadTime }
       } as ProcessStatusResponse);
+      setActiveResultTab('visualization');
 
       let finished = false;
+      let consecutivePollErrors = 0;
       while (!finished) {
         await new Promise((resolve) => setTimeout(resolve, 2500));
-        const statusRes = await axios.get<ProcessStatusResponse>(`${backendBaseUrl}/api/scripts/process/${startedJobId}`, {
-          timeout: 0,
-        });
+        let statusRes;
+        try {
+          statusRes = await axios.get<ProcessStatusResponse>(`${backendBaseUrl}/api/scripts/process/${startedJobId}`, {
+            timeout: 0,
+          });
+          consecutivePollErrors = 0;
+        } catch (pollError: any) {
+          consecutivePollErrors += 1;
+          setJobMessage(`Connection retry ${consecutivePollErrors}/10 while job is still running...`);
+          if (consecutivePollErrors >= 10) {
+            throw new Error(pollError?.response?.data?.error || pollError?.message || 'Repeated polling failures');
+          }
+          continue;
+        }
 
         setJobStage(statusRes.data.stage);
         setJobMessage(statusRes.data.message);
@@ -442,6 +478,16 @@ export default function Home() {
                   {response?.timings?.uploadAndContact && <div className="flex items-center gap-2"><CheckCircle className="h-4 w-4 text-emerald-500" /><span>Upload & Init: {(response.timings.uploadAndContact / 1000).toFixed(1)}s</span></div>}
                   {response?.timings?.visualization ? <div className="flex items-center gap-2"><CheckCircle className="h-4 w-4 text-emerald-500" /><span>Visualization: {(response.timings.visualization / 1000).toFixed(1)}s</span></div> : <div className="flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin text-cyan-500/70" /><span>Waiting for Visualization</span></div>}
                   {response?.timings?.modelInference ? <div className="flex items-center gap-2"><CheckCircle className="h-4 w-4 text-emerald-500" /><span>Model Inference: {(response.timings.modelInference / 1000).toFixed(1)}s</span></div> : (response?.timings?.visualization ? <div className="flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin text-cyan-500/70" /><span>Waiting for Model Inference</span></div> : null)}
+                  {response?.timings?.kaggleSegmentation ? <div className="flex items-center gap-2"><CheckCircle className="h-4 w-4 text-emerald-500" /><span>Kaggle Segmentation: {(response.timings.kaggleSegmentation / 1000).toFixed(1)}s</span></div> : null}
+                  {response?.timings?.inkDetection ? <div className="flex items-center gap-2"><CheckCircle className="h-4 w-4 text-emerald-500" /><span>Ink Detection: {(response.timings.inkDetection / 1000).toFixed(1)}s</span></div> : null}
+                </div>
+              )}
+              {response?.logLines && response.logLines.length > 0 && (
+                <div className="mt-3 border-t border-cyan-200/50 dark:border-cyan-800/50 pt-3">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-cyan-800 dark:text-cyan-300">Live Logs</p>
+                  <pre className="mt-2 max-h-44 overflow-auto rounded-lg bg-slate-900 text-cyan-200 p-3 text-xs leading-relaxed whitespace-pre-wrap">
+                    {response.logLines.slice(-30).join('\n')}
+                  </pre>
                 </div>
               )}
               <p className="mt-4 text-sm opacity-80 text-cyan-800 dark:text-cyan-300">Large TIFF sets can take time. You can keep the tab open while status updates continue.</p>
@@ -471,6 +517,8 @@ export default function Home() {
                 {response?.timings?.uploadAndContact && <p>Upload & Init: {(response.timings.uploadAndContact / 1000).toFixed(1)}s</p>}
                 {response?.timings?.visualization && <p>Visualization: {(response.timings.visualization / 1000).toFixed(1)}s</p>}
                 {response?.timings?.modelInference && <p>Model Inference: {(response.timings.modelInference / 1000).toFixed(1)}s</p>}
+                {response?.timings?.kaggleSegmentation && <p>Kaggle Segmentation: {(response.timings.kaggleSegmentation / 1000).toFixed(1)}s</p>}
+                {response?.timings?.inkDetection && <p>Ink Detection: {(response.timings.inkDetection / 1000).toFixed(1)}s</p>}
               </div>
             )}
           </section>
@@ -478,10 +526,59 @@ export default function Home() {
 
         {groupedOutputs && (
           <div className="space-y-6">
-            <VisualizationSection files={groupedOutputs.vis} onImageClick={setSelectedImage} />
-            <OutputGroup title="UNet Output" files={groupedOutputs.unet} accentClassName="text-emerald-700 dark:text-emerald-300" onImageClick={setSelectedImage} />
-            <OutputGroup title="nnUNet Output" files={groupedOutputs.nnunet} accentClassName="text-violet-700" onImageClick={setSelectedImage} />
-            <OutputGroup title="Model Inference" files={groupedOutputs.other} accentClassName="text-slate-700" onImageClick={setSelectedImage} />
+            <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-slate-900/90 p-4 shadow-sm">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveResultTab('visualization')}
+                  className={`rounded-lg px-4 py-2 text-sm font-semibold transition ${activeResultTab === 'visualization' ? 'bg-cyan-600 text-white' : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'}`}
+                >
+                  Visualization
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveResultTab('segmentation')}
+                  className={`rounded-lg px-4 py-2 text-sm font-semibold transition ${activeResultTab === 'segmentation' ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'}`}
+                >
+                  Segmentation
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveResultTab('text-recovery')}
+                  className={`rounded-lg px-4 py-2 text-sm font-semibold transition ${activeResultTab === 'text-recovery' ? 'bg-amber-600 text-white' : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'}`}
+                >
+                  Text Recovery
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveResultTab('other')}
+                  className={`rounded-lg px-4 py-2 text-sm font-semibold transition ${activeResultTab === 'other' ? 'bg-slate-700 text-white' : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'}`}
+                >
+                  Other
+                </button>
+              </div>
+            </section>
+
+            {activeResultTab === 'visualization' && (
+              <VisualizationSection files={groupedOutputs.vis} onImageClick={setSelectedImage} />
+            )}
+
+            {activeResultTab === 'segmentation' && (
+              <>
+                <OutputGroup title="UNet Output" files={groupedOutputs.unet} accentClassName="text-emerald-700 dark:text-emerald-300" onImageClick={setSelectedImage} />
+                <OutputGroup title="nnUNet Output" files={groupedOutputs.nnunet} accentClassName="text-violet-700" onImageClick={setSelectedImage} />
+                <OutputGroup title="Final Model Output" files={groupedOutputs.finalModel} accentClassName="text-fuchsia-700 dark:text-fuchsia-300" onImageClick={setSelectedImage} />
+                <OutputGroup title="Kaggle 1st-Place Segmentation" files={groupedOutputs.kaggleSeg} accentClassName="text-lime-700 dark:text-lime-300" onImageClick={setSelectedImage} />
+              </>
+            )}
+
+            {activeResultTab === 'text-recovery' && (
+              <OutputGroup title="Recovered Text (Ink Detection)" files={groupedOutputs.textRecovery} accentClassName="text-amber-700 dark:text-amber-300" onImageClick={setSelectedImage} />
+            )}
+
+            {activeResultTab === 'other' && (
+              <OutputGroup title="Model Inference" files={groupedOutputs.other} accentClassName="text-slate-700" onImageClick={setSelectedImage} />
+            )}
           </div>
         )}
       </div>
