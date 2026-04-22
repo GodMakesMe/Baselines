@@ -8,3 +8,5 @@ Winner/
 output/
 outputs/
 temp/
+Ink-dataset/
+*.zip

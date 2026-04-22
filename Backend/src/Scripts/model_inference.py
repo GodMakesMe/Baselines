@@ -426,6 +426,19 @@ def load_final_nnunet_models(
         if os.path.exists(ckpt_file):
             valid_model_dirs.append(model_dir)
 
+    # Prefer smaller-patch models first so low-VRAM GPUs pick a lighter model
+    # when max_models is set to 1.
+    def _patch_volume(p):
+        try:
+            import json as _json
+            with open(os.path.join(p, "plans.json")) as f:
+                cfg = _json.load(f).get("configurations", {}).get("3d_fullres", {})
+                ps = cfg.get("patch_size") or [999, 999, 999]
+                return int(ps[0]) * int(ps[1]) * int(ps[2])
+        except Exception:
+            return 10**9
+    valid_model_dirs.sort(key=_patch_volume)
+
     if not valid_model_dirs:
         print("  No checkpoint_best.pth files found in final models")
         return {}
@@ -674,6 +687,10 @@ def main():
             predictions["3D U-Net"] = pred_3c
             prob_maps["3D U-Net"] = probs[1]
             print(f"    Surface voxels: {(pred_3c == 1).sum():,}")
+            # Free VRAM before the next (larger) nnU-Net stage on low-memory GPUs.
+            model_unet.to("cpu")
+            del probs
+            torch.cuda.empty_cache()
 
         # ── nnU-Net Ensemble ──
         if nnunet_predictors:
@@ -726,6 +743,9 @@ def main():
         save_model_previews(image, predictions, prob_maps, sample_id, args.output_dir)
 
         torch.cuda.empty_cache()
+        # Move U-Net back to GPU for the next volume, if more remain.
+        if model_unet is not None and tif_path != tif_files[-1]:
+            model_unet.to(device)
 
         # ── Manifest entry ──
         entry = {

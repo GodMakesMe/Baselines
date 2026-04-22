@@ -17,8 +17,10 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -84,6 +86,8 @@ def autodetect_command(
             if script.name == "inference_timesformer.py":
                 script_text = script.read_text(encoding="utf-8", errors="ignore")
                 uses_start_idx = "start_idx" in script_text
+                batch_size = int(os.environ.get("INK_BATCH_SIZE", "2"))
+                workers = int(os.environ.get("INK_WORKERS", "2"))
                 command = [
                     sys.executable,
                     str(script),
@@ -93,6 +97,12 @@ def autodetect_command(
                     str(checkpoint) if checkpoint else "",
                     "--out_path",
                     str(output_dir),
+                    "--batch_size",
+                    str(batch_size),
+                    "--workers",
+                    str(workers),
+                    "--gpus",
+                    "1",
                 ]
                 if uses_start_idx:
                     command.extend(["--start_idx", str(start_layer)])
@@ -160,8 +170,11 @@ def collect_candidate_images(output_dir: Path) -> list[Path]:
     for path in output_dir.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in exts:
             continue
-
+        if "_prepared" in path.parts:
+            continue
         name = path.name.lower()
+        if name.endswith("_enhanced.png") or name.endswith("_binary.png"):
+            continue
         score = 0
         for token in ("ink", "prob", "pred", "mask", "timesformer"):
             if token in name:
@@ -230,21 +243,11 @@ def prepare_segment_layout(input_dir: Path, segmentation_dir: Path, work_root: P
 
         segment_ids.append(fragment_id)
 
-    # Optional mask from segmentation output.
-    for segment_id in segment_ids:
-        seg_mask_tif = segmentation_dir / f"{segment_id}.tif"
-        if not seg_mask_tif.exists():
-            continue
-        try:
-            seg_mask = tifffile.imread(seg_mask_tif)
-            if seg_mask.ndim == 3:
-                surface = np.any(seg_mask == 1, axis=0).astype(np.uint8)
-            else:
-                surface = (seg_mask == 1).astype(np.uint8)
-            mask_path = segment_path / segment_id / f"{segment_id}_mask.png"
-            Image.fromarray((surface * 255).astype(np.uint8)).save(mask_path)
-        except Exception as exc:
-            print(f"[ink-detect] Could not create mask for {segment_id}: {exc}")
+    # We intentionally do NOT generate a *_mask.png from the segmentation TIF:
+    # the nnU-Net mask flags ~0.6% surface voxels, and the Winner's tile filter
+    # drops any tile that contains a single 0-pixel. After 2D projection + edge
+    # padding that filter rejects every tile. Letting Winner fall back to an
+    # all-white mask (its default) keeps the full volume in play.
 
     return segment_path, segment_ids
 
@@ -276,50 +279,53 @@ def main() -> None:
     if checkpoint is None or not checkpoint.is_file():
         raise SystemExit("INK_CHECKPOINT is not set or does not exist. This stage only supports pretrained checkpoint inference.")
 
-    prepared_root = output_dir / "_prepared"
-    segment_path, segment_ids = prepare_segment_layout(input_dir, segmentation_dir, prepared_root)
-    if not segment_ids:
-        raise SystemExit("No valid segments found for ink detection. Provide fragment folders with layers or TIFF volumes.")
+    prepared_root = Path(tempfile.mkdtemp(prefix="ink_prepared_"))
+    try:
+        segment_path, segment_ids = prepare_segment_layout(input_dir, segmentation_dir, prepared_root)
+        if not segment_ids:
+            raise SystemExit("No valid segments found for ink detection. Provide fragment folders with layers or TIFF volumes.")
 
-    env = os.environ.copy()
-    env["INK_INPUT_DIR"] = str(input_dir)
-    env["INK_SEGMENTATION_DIR"] = str(segmentation_dir)
-    env["INK_OUTPUT_DIR"] = str(output_dir)
-    env["INK_SEGMENT_PATH"] = str(segment_path)
-    env["INK_REPO_DIR"] = str(repo_dir)
-    env["INK_DEVICE"] = args.device
-    env["INK_CHECKPOINT"] = str(checkpoint)
+        env = os.environ.copy()
+        env["INK_INPUT_DIR"] = str(input_dir)
+        env["INK_SEGMENTATION_DIR"] = str(segmentation_dir)
+        env["INK_OUTPUT_DIR"] = str(output_dir)
+        env["INK_SEGMENT_PATH"] = str(segment_path)
+        env["INK_REPO_DIR"] = str(repo_dir)
+        env["INK_DEVICE"] = args.device
+        env["INK_CHECKPOINT"] = str(checkpoint)
 
-    if args.command:
-        command = build_from_template(
-            args.command,
-            repo_dir,
-            segment_path,
-            segmentation_dir,
-            output_dir,
-            checkpoint,
-            args.device,
-        )
-    else:
-        command = autodetect_command(
-            repo_dir,
-            segment_path,
-            segment_ids,
-            output_dir,
-            checkpoint,
-            args.device,
-            args.start_layer,
-            args.num_layers,
-        )
+        if args.command:
+            command = build_from_template(
+                args.command,
+                repo_dir,
+                segment_path,
+                segmentation_dir,
+                output_dir,
+                checkpoint,
+                args.device,
+            )
+        else:
+            command = autodetect_command(
+                repo_dir,
+                segment_path,
+                segment_ids,
+                output_dir,
+                checkpoint,
+                args.device,
+                args.start_layer,
+                args.num_layers,
+            )
 
-    if not command:
-        raise SystemExit(
-            "Could not auto-detect an ink inference entry point. Set INK_COMMAND with placeholders."
-        )
+        if not command:
+            raise SystemExit(
+                "Could not auto-detect an ink inference entry point. Set INK_COMMAND with placeholders."
+            )
 
-    code = run_external(command, repo_dir, env)
-    if code != 0:
-        raise SystemExit(code)
+        code = run_external(command, repo_dir, env)
+        if code != 0:
+            raise SystemExit(code)
+    finally:
+        shutil.rmtree(prepared_root, ignore_errors=True)
 
     candidates = collect_candidate_images(output_dir)
     if not candidates:

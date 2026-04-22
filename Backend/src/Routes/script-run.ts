@@ -369,6 +369,7 @@ function runPythonScript(
           PYTHONIOENCODING: 'utf-8',
           PYTHONUTF8: '1',
           PYTHONUNBUFFERED: '1',
+          PYTORCH_CUDA_ALLOC_CONF: process.env.PYTORCH_CUDA_ALLOC_CONF ?? 'expandable_segments:True',
         },
         windowsHide: true,
       },
@@ -489,6 +490,8 @@ async function processJob(jobId: string, uploadedFiles: Express.Multer.File[]): 
   const nnunetTileStep = resolveNumberEnv(0.5, 'inference_nnunet_tile_step', 'INFERENCE_NNUNET_TILE_STEP');
   const nnunetNoMirroring = resolveBooleanEnv('inference_nnunet_no_mirroring', 'INFERENCE_NNUNET_NO_MIRRORING');
   const skipLegacyNnUnetByEnv = resolveBooleanEnv('inference_skip_legacy_nnunet', 'INFERENCE_SKIP_LEGACY_NNUNET');
+  const skipUnetByEnv = resolveBooleanEnv('inference_skip_unet', 'INFERENCE_SKIP_UNET');
+  const skipFinalByEnv = resolveBooleanEnv('inference_skip_final_model', 'INFERENCE_SKIP_FINAL_MODEL');
 
   try {
     updateJob(jobId, { status: 'running', stage: 'preparing', message: 'Preparing files...' });
@@ -570,6 +573,16 @@ async function processJob(jobId: string, uploadedFiles: Express.Multer.File[]): 
         jobId,
         `[job:${jobId}:model_inference] Legacy nnU-Net skipped (${skipLegacyNnUnetByEnv ? 'env flag' : 'checkpoints not found in nnUNet_data'}).`,
       );
+    }
+
+    if (skipUnetByEnv) {
+      modelInferenceArgs.push('--skip-unet');
+      appendJobLog(jobId, `[job:${jobId}:model_inference] Custom 3D U-Net skipped (env flag).`);
+    }
+
+    if (skipFinalByEnv) {
+      modelInferenceArgs.push('--skip-final-model');
+      appendJobLog(jobId, `[job:${jobId}:model_inference] Final nnU-Net model(s) skipped (env flag).`);
     }
 
     if (inferenceFastMode) {

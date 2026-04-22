@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import scriptRunRouter from './Routes/script-run';
+import inkDetectionRouter from './Routes/ink-detection';
 
 const app = express();
 const port = 2632;
@@ -35,6 +36,7 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use('/api/scripts', scriptRunRouter);
+app.use('/api/ink', inkDetectionRouter);
 
 
 

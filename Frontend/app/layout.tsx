@@ -1,5 +1,6 @@
 import './globals.css';
 import { Space_Grotesk, JetBrains_Mono } from 'next/font/google';
+import AppShell from './_components/AppShell';
 
 const headingFont = Space_Grotesk({
   subsets: ['latin'],
@@ -25,7 +26,9 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className={`${headingFont.variable} ${monoFont.variable}`}>{children}</body>
+      <body className={`${headingFont.variable} ${monoFont.variable}`}>
+        <AppShell>{children}</AppShell>
+      </body>
     </html>
   );
 }
